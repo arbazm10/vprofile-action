@@ -1,0 +1,174 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  setup-terraform:
+    name: Setup Terraform and Create EKS Cluster
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v1
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply tfplan
+        env:
+          TF_VAR_aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          TF_VAR_aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    needs: setup-terraform
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up JDK
+        uses: actions/setup-java@v2
+        with:
+          java-version: '11'
+
+      - name: Build with Maven
+        run: mvn clean install -B -V
+
+      - name: Run Unit Tests
+        run: mvn test
+
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v2
+        with:
+          name: test-results
+          path: target/surefire-reports
+
+  deploy_to_dev:
+    name: Deploy to Development Environment
+    runs-on: ubuntu-latest
+    needs: build
+
+    environment:
+      name: Development
+      url: http://development.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Deploy to Development
+        run: |
+          scp -r target/my-app.jar user@development.example.com:/path/to/deployment
+          ssh user@development.example.com "sudo systemctl restart my-app"
+
+  deploy_to_test:
+    name: Deploy to Test Environment
+    runs-on: ubuntu-latest
+    needs: build
+
+    environment:
+      name: Test
+      url: http://test.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Deploy to Test
+        run: |
+          scp -r target/my-app.jar user@test.example.com:/path/to/deployment
+          ssh user@test.example.com "sudo systemctl restart my-app"
+
+  deploy_to_prod:
+    name: Deploy to Production Environment
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    environment:
+      name: Production
+      url: http://production.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Deploy to Production
+        run: |
+          scp -r target/my-app.jar user@production.example.com:/path/to/deployment
+          ssh user@production.example.com "sudo systemctl restart my-app"
+
+  kubernetes_deploy:
+    name: Deploy to Kubernetes (EKS)
+    runs-on: ubuntu-latest
+    needs: deploy_to_dev  # Wait for deployment to Development environment to complete
+
+    environment:
+      name: Kubernetes
+      url: https://eks-cluster-url
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: <your-aws-region>
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+      - name: Configure kubectl
+        run: |
+          aws eks --region <your-aws-region> update-kubeconfig --name <your-eks-cluster-name>
+
+      - name: Deploy Nginx Ingress Controller
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/aws/deploy.yaml
+
+      - name: Deploy Application to Kubernetes
+        run: |
+          kubectl apply -f path/to/your/kubernetes/manifests
+          # Example: kubectl apply -f kubernetes/deployment.yaml
+
+  notifications:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy_to_dev, deploy_to_test, deploy_to_prod, kubernetes_deploy]
+
+    if: always()
+
+    steps:
+      - name: Notify Slack on Success
+        if: success()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        with:
+          message: "Deployment to ${{ github.event_name }} succeeded for commit ${{ github.sha }}"
+
+      - name: Notify Slack on Failure
+        if: failure()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        with:
+          message: "Deployment to ${{ github.event_name }} failed for commit ${{ github.sha }}"
+
